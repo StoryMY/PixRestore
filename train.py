@@ -35,6 +35,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", help="Override output directory")
     parser.add_argument("--test-lq-dir", help="Override evaluation LQ directory")
     parser.add_argument("--test-gt-dir", help="Override evaluation GT directory")
+    parser.add_argument("--test-manifest", help="Paired LQ/GT JSONL for evaluation")
+    parser.add_argument("--final-test-manifest", help="Paired LQ/GT JSONL evaluated after training")
     parser.add_argument("--pretrained", help="Model weights or a checkpoint directory")
     parser.add_argument("--dinov2-repository", help="Optional local DINOv2 repository clone")
     parser.add_argument("--dinov2-checkpoint", help="Optional local DINOv2 checkpoint")
@@ -65,6 +67,8 @@ def load_config(cli: argparse.Namespace) -> SimpleNamespace:
         "output_dir": cli.output_dir,
         "test_lq_dir": cli.test_lq_dir,
         "test_gt_dir": cli.test_gt_dir,
+        "test_manifest": cli.test_manifest,
+        "final_test_manifest": cli.final_test_manifest,
         "pretrained": cli.pretrained,
         "dinov2_repository": cli.dinov2_repository,
         "dinov2_checkpoint": cli.dinov2_checkpoint,
@@ -219,6 +223,34 @@ def center_crop(image, size: int):
     return image.crop((left, top, left + size, top + size))
 
 
+def read_evaluation_manifest(path: str | Path) -> list[tuple[Path, Path, str]]:
+    manifest = Path(path)
+    samples = []
+    with manifest.open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"{manifest}:{line_number}: invalid JSON") from error
+            lq = row.get("lq") or row.get("LQ")
+            gt = row.get("gt") or row.get("GT")
+            if not lq or not gt:
+                raise ValueError(f"{manifest}:{line_number}: expected lq and gt fields")
+            lq_path = Path(lq).expanduser()
+            gt_path = Path(gt).expanduser()
+            if not lq_path.is_absolute():
+                lq_path = manifest.parent / lq_path
+            if not gt_path.is_absolute():
+                gt_path = manifest.parent / gt_path
+            # Frame names repeat across scenes, so use the manifest line as a stable output prefix.
+            samples.append((lq_path, gt_path, f"{line_number:06d}_{lq_path.stem}"))
+    if not samples:
+        raise ValueError(f"No valid LQ/GT pairs found in {manifest}")
+    return samples
+
+
 @torch.no_grad()
 def evaluate(
     config: SimpleNamespace,
@@ -227,31 +259,40 @@ def evaluate(
     encoder: torch.nn.Module,
     flow: PixelDiffusion,
     step: int,
+    *,
+    manifest: str | None = None,
+    output_name: str | None = None,
+    metric_name: str = "eval/psnr",
 ) -> None:
-    if not config.test_lq_dir:
+    test_manifest = manifest or getattr(config, "test_manifest", None)
+    if not config.test_lq_dir and not test_manifest:
         return
     from PIL import Image
     from torchvision.transforms.functional import pil_to_tensor
 
-    paths = sorted(
-        path
-        for path in Path(config.test_lq_dir).iterdir()
-        if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
-    )
-    paths = paths[accelerator.process_index :: accelerator.num_processes]
-    output_dir = Path(config.output_dir) / "samples" / f"{step:08d}"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    gt_paths = {}
-    if config.test_gt_dir:
-        gt_paths = {
-            path.stem: path
-            for path in Path(config.test_gt_dir).iterdir()
+    if test_manifest:
+        samples = read_evaluation_manifest(test_manifest)
+    else:
+        paths = sorted(
+            path
+            for path in Path(config.test_lq_dir).iterdir()
             if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
-        }
+        )
+        gt_paths = {}
+        if config.test_gt_dir:
+            gt_paths = {
+                path.stem: path
+                for path in Path(config.test_gt_dir).iterdir()
+                if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+            }
+        samples = [(path, gt_paths.get(path.stem), path.stem) for path in paths]
+    samples = samples[accelerator.process_index :: accelerator.num_processes]
+    output_dir = Path(config.output_dir) / "samples" / (output_name or f"{step:08d}")
+    output_dir.mkdir(parents=True, exist_ok=True)
     psnr_sum = torch.zeros(1, device=accelerator.device)
     psnr_count = torch.zeros(1, device=accelerator.device)
     model.eval()
-    for path in paths:
+    for path, gt_path, output_name in samples:
         with Image.open(path) as image:
             image = center_crop(image.convert("RGB"), config.resolution)
         lq = pil_to_tensor(image).unsqueeze(0).to(accelerator.device).float().div_(127.5).sub_(1)
@@ -264,9 +305,10 @@ def evaluate(
                 n_steps=config.eval_sampling_steps,
             )
         restored = restored.add(1).mul(0.5).clamp(0, 1)
-        save_image(restored, output_dir / f"{path.stem}.png")
-        if path.stem in gt_paths:
-            with Image.open(gt_paths[path.stem]) as image:
+        input_image = lq.add(1).mul(0.5).clamp(0, 1)
+        save_image(torch.cat((input_image, restored), dim=-1), output_dir / f"{output_name}.png")
+        if gt_path is not None:
+            with Image.open(gt_path) as image:
                 gt = center_crop(image.convert("RGB"), config.resolution)
             gt = pil_to_tensor(gt).unsqueeze(0).to(accelerator.device).float().div_(255)
             mse = (restored.float() - gt).square().mean().clamp_min(1e-12)
@@ -278,7 +320,7 @@ def evaluate(
         psnr = (psnr_sum / psnr_count).item()
         LOGGER.info("Evaluation at step %d: PSNR %.4f dB", step, psnr)
         if config.report_to:
-            accelerator.log({"eval/psnr": psnr}, step=step)
+            accelerator.log({metric_name: psnr}, step=step)
     model.train()
 
 
@@ -544,6 +586,20 @@ def main() -> None:
                 break
 
     progress.close()
+    final_test_manifest = getattr(config, "final_test_manifest", None)
+    if final_test_manifest:
+        evaluate(
+            config,
+            accelerator,
+            ema,
+            encoder,
+            flow,
+            step,
+            manifest=final_test_manifest,
+            output_name="final",
+            metric_name="eval/final_psnr",
+        )
+        accelerator.wait_for_everyone()
     accelerator.end_training()
 
 

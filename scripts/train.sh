@@ -16,10 +16,16 @@ if [[ "$CONFIG" == *gan* ]]; then
   export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-1}"
 fi
 
-XFORMERS_DISABLED=1 accelerate launch \
-  --multi_gpu \
-  --num_processes "$NUM_PROCESSES" \
-  --main_process_port "$MAIN_PROCESS_PORT" \
+LAUNCH_ARGS=(
+  --num_processes "$NUM_PROCESSES"
+  --main_process_port "$MAIN_PROCESS_PORT"
+)
+
+if (( NUM_PROCESSES > 1 )); then
+  LAUNCH_ARGS=(--multi_gpu "${LAUNCH_ARGS[@]}")
+fi
+
+XFORMERS_DISABLED=1 accelerate launch "${LAUNCH_ARGS[@]}" \
   train.py \
   --config "$CONFIG" \
   "$@"

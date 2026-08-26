@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader
 from pixrestore import LightningDiT_PixelDiffusion, MeanFlowIR_PixelDiffusion
 from pixrestore.data import PairedJsonlDataset, collate_pairs
 from pixrestore.gan import MultiLayerDinoDiscriminator, as_feature_list, set_requires_grad
+from train import read_evaluation_manifest
 
 
 class TinyFrozenEncoder(nn.Module):
@@ -44,6 +45,21 @@ def make_batch() -> dict:
         )
         dataset = PairedJsonlDataset([manifest], crop_size=16)
         return next(iter(DataLoader(dataset, batch_size=1, collate_fn=collate_pairs)))
+
+
+def check_evaluation_manifest() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "nested").mkdir()
+        Image.new("RGB", (24, 20)).save(root / "nested" / "lq.png")
+        Image.new("RGB", (24, 20)).save(root / "nested" / "gt.png")
+        manifest = root / "pairs.jsonl"
+        manifest.write_text(
+            json.dumps({"lq": "nested/lq.png", "gt": "nested/gt.png"}) + "\n"
+        )
+        samples = read_evaluation_manifest(manifest)
+        if samples != [(root / "nested" / "lq.png", root / "nested" / "gt.png", "000001_lq")]:
+            raise RuntimeError(f"Unexpected evaluation manifest samples: {samples}")
 
 
 def make_config(mode: str) -> SimpleNamespace:
@@ -158,4 +174,5 @@ def run(mode: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("standard", "gan"), required=True)
+    check_evaluation_manifest()
     run(parser.parse_args().mode)

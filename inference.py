@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import subprocess
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -66,6 +68,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dinov2-repository", help="Local DINOv2 repository")
     parser.add_argument("--dinov2-checkpoint", help="Local DINOv2 weights")
+    parser.add_argument(
+        "--comparison-video",
+        help="Optional MP4 path for an original-left/restored-right comparison video.",
+    )
+    parser.add_argument("--comparison-fps", type=int, default=24)
     return parser.parse_args()
 
 
@@ -327,6 +334,70 @@ def output_path(
     return folder / f"{sample['path'].stem}.png"
 
 
+def create_comparison_video(
+    samples: list[dict],
+    output_root: Path,
+    method: str | None,
+    config: SimpleNamespace,
+    infer_steps: int,
+    schedule: str,
+    destination: Path,
+    fps: int,
+) -> None:
+    if fps <= 0:
+        raise ValueError("Comparison video FPS must be positive")
+
+    pairs = []
+    frame_width = frame_height = 0
+    for sample in samples:
+        restored_path = output_path(
+            sample, output_root, method, config, infer_steps, schedule
+        )
+        with Image.open(sample["path"]) as original, Image.open(restored_path) as restored:
+            original_size = original.size
+            restored_size = restored.size
+        pairs.append((sample["path"], restored_path, original_size, restored_size))
+        frame_width = max(frame_width, original_size[0] + restored_size[0])
+        frame_height = max(frame_height, original_size[1], restored_size[1])
+
+    frame_width += frame_width % 2
+    frame_height += frame_height % 2
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with tempfile.TemporaryDirectory(prefix="pixrestore-comparison-") as directory:
+            frame_directory = Path(directory)
+            for index, (original_path, restored_path, original_size, restored_size) in enumerate(pairs, 1):
+                with Image.open(original_path) as original, Image.open(restored_path) as restored:
+                    original = original.convert("RGB")
+                    restored = restored.convert("RGB")
+                    frame = Image.new("RGB", (frame_width, frame_height))
+                    frame.paste(original, (0, (frame_height - original_size[1]) // 2))
+                    frame.paste(restored, (original_size[0], (frame_height - restored_size[1]) // 2))
+                    frame.save(frame_directory / f"{index:08d}.png")
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-framerate",
+                    str(fps),
+                    "-start_number",
+                    "1",
+                    "-i",
+                    str(frame_directory / "%08d.png"),
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-movflags",
+                    "+faststart",
+                    str(destination),
+                ],
+                check=True,
+            )
+    except FileNotFoundError as error:
+        raise RuntimeError("FFmpeg is required to create a comparison video") from error
+
+
 def main() -> None:
     args = parse_args()
     checkpoint = Path(args.checkpoint).expanduser().resolve()
@@ -422,6 +493,19 @@ def main() -> None:
 
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
+        if args.comparison_video:
+            video_path = Path(args.comparison_video).expanduser().resolve()
+            create_comparison_video(
+                samples,
+                output_root,
+                args.method,
+                config,
+                args.infer_steps,
+                args.schedule,
+                video_path,
+                args.comparison_fps,
+            )
+            LOGGER.info("Comparison video saved to %s", video_path)
         LOGGER.info("Done. Results saved under %s", output_root)
 
 
