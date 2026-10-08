@@ -1,0 +1,16 @@
+base_config: configs/train.yaml
+
+output_dir: outputs/my-task
+global_batch_size: 16
+gradient_accumulation_steps: 1
+num_workers: 4
+max_steps: 30000
+checkpoint_steps: 3000
+eval_steps: 3000
+eval_sampling_steps: 1
+warmup_steps: 0
+
+learning_rate: 1.0e-4
+weight_decay: 1.0e-2
+
+fixed_train_t: 1.0
