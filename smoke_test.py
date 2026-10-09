@@ -18,7 +18,61 @@ from torch.utils.data import DataLoader
 from pixrestore import LightningDiT_PixelDiffusion, MeanFlowIR_PixelDiffusion
 from pixrestore.data import PairedJsonlDataset, collate_pairs
 from pixrestore.gan import MultiLayerDinoDiscriminator, as_feature_list, set_requires_grad
-from train import read_evaluation_manifest
+from train import load_pretrained, read_evaluation_manifest
+
+
+def check_pretrained_block_selection() -> None:
+    def make_model(depth: int, width: int = 2):
+        model = nn.Module()
+        model.blocks = nn.ModuleList([nn.Linear(width, width) for _ in range(depth)])
+        model.gate_block_embed = nn.Embedding(depth, width)
+        model.final_layer = nn.Linear(width, 3)
+        return model
+
+    source = make_model(12)
+    with torch.no_grad():
+        for index, block in enumerate(source.blocks):
+            block.weight.fill_(index + 1)
+            block.bias.fill_(-index - 1)
+            source.gate_block_embed.weight[index].fill_(index + 20)
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "source.pth"
+        torch.save(source.state_dict(), path)
+        for indices in ([0, 2, 4, 6, 8, 11], [0, 1, 3, 4, 6, 7, 9, 11]):
+            model, ema = make_model(len(indices)), make_model(len(indices))
+            load_pretrained(model, ema, path, block_indices=indices)
+            for target, original in enumerate(indices):
+                torch.testing.assert_close(model.blocks[target].weight, source.blocks[original].weight)
+                torch.testing.assert_close(model.blocks[target].bias, source.blocks[original].bias)
+            torch.testing.assert_close(model.gate_block_embed.weight, source.gate_block_embed.weight[indices])
+            torch.testing.assert_close(model.final_layer.weight, source.final_layer.weight)
+            for key, value in model.state_dict().items():
+                torch.testing.assert_close(ema.state_dict()[key], value)
+            small_path = Path(directory) / "small.pth"
+            torch.save(ema.state_dict(), small_path)
+            reloaded = make_model(len(indices))
+            load_pretrained(reloaded, make_model(len(indices)), small_path)
+            for key, value in model.state_dict().items():
+                torch.testing.assert_close(reloaded.state_dict()[key], value)
+
+        cases = [
+            (path, [0, 2], 2),
+            (path, [0, 2, 4, 6, 8, 8], 2),
+            (path, [0, 2, 4, 6, 8, 12], 2),
+            (path, [0, 2, 4, 6, 8, -1], 2),
+            (path, [0, 2, 4, 6, 8, True], 2),
+            (path, [0, 2, 4, 6, 8, 11], 3),
+            (small_path, list(range(8)), 2),
+        ]
+        for checkpoint, indices, width in cases:
+            depth = 8 if checkpoint == small_path else 6
+            try:
+                load_pretrained(make_model(depth, width), make_model(depth, width), checkpoint, block_indices=indices)
+            except ValueError:
+                pass
+            else:
+                raise RuntimeError(f"Invalid block selection accepted: {indices}, width={width}")
+    print("OK: depth-6/depth-8 initialization, EMA, reload and invalid selections")
 
 
 class TinyFrozenEncoder(nn.Module):
@@ -175,4 +229,5 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("standard", "gan"), required=True)
     check_evaluation_manifest()
+    check_pretrained_block_selection()
     run(parser.parse_args().mode)

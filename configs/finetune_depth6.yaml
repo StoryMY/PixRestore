@@ -1,0 +1,24 @@
+# Depth-only small model: initialize from the released 12-block PixRestore-S.
+# Keep this base explicit: train.py merges only one base_config level.
+base_config: configs/train.yaml
+
+depth: 6
+pretrained_block_indices: [0, 2, 4, 6, 8, 11]
+# For depth 8, use depth: 8 and indices: [0, 1, 3, 4, 6, 7, 9, 11].
+# Remove pretrained_block_indices when --pretrained is already a small model.
+# resume loads the small training checkpoint directly without applying this map.
+
+output_dir: outputs/finetune_depth6
+global_batch_size: 16
+gradient_accumulation_steps: 1
+num_workers: 4
+max_steps: 30000
+checkpoint_steps: 3000
+eval_steps: 3000
+eval_sampling_steps: 1
+warmup_steps: 0
+
+learning_rate: 1.0e-4
+weight_decay: 1.0e-2
+
+fixed_train_t: 1.0

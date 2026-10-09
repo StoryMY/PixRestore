@@ -165,6 +165,8 @@ def load_pretrained(
     model: torch.nn.Module,
     ema: torch.nn.Module,
     path: str | Path,
+    *,
+    block_indices: list[int] | None = None,
 ) -> None:
     path = Path(path).expanduser()
     if path.is_dir():
@@ -179,6 +181,44 @@ def load_pretrained(
         raise FileNotFoundError(f"Pretrained weights not found: {path}")
     state = load_file(path) if path.suffix == ".safetensors" else torch.load(path, map_location="cpu")
     current = model.state_dict()
+    if block_indices is not None:
+        target_depth = len(model.blocks)
+        if not isinstance(block_indices, (list, tuple)) or len(block_indices) != target_depth:
+            raise ValueError("pretrained_block_indices must contain one source index per target block")
+        if any(type(index) is not int or index < 0 for index in block_indices):
+            raise ValueError("pretrained_block_indices must contain non-negative integers")
+        if len(set(block_indices)) != target_depth:
+            raise ValueError("pretrained_block_indices must not contain duplicate indices")
+        source_indices = {int(key.split(".")[1]) for key in state if key.startswith("blocks.")}
+        source_depth = len(source_indices)
+        if source_indices != set(range(source_depth)) or source_depth <= target_depth:
+            raise ValueError(
+                "Block selection requires a deeper source checkpoint with contiguous blocks; "
+                "omit pretrained_block_indices when loading an already-small checkpoint"
+            )
+        if any(index >= source_depth for index in block_indices):
+            raise ValueError(f"pretrained_block_indices exceeds source depth {source_depth}")
+        remapped = {key: value for key, value in state.items() if not key.startswith("blocks.")}
+        for target_index, source_index in enumerate(block_indices):
+            source_prefix = f"blocks.{source_index}."
+            for key, value in state.items():
+                if key.startswith(source_prefix):
+                    remapped[f"blocks.{target_index}." + key[len(source_prefix):]] = value
+        gate_key = "gate_block_embed.weight"
+        if gate_key in current:
+            if gate_key not in state or state[gate_key].shape[0] != source_depth:
+                raise ValueError("Source gate_block_embed must match the source block depth")
+            remapped[gate_key] = state[gate_key][list(block_indices)]
+        # Depth-only selection must preserve every target tensor, not silently
+        # leave random parameters behind after an incompatible width change.
+        incompatible = [
+            key for key, value in current.items()
+            if key not in remapped or tuple(remapped[key].shape) != tuple(value.shape)
+        ]
+        if incompatible:
+            raise ValueError(f"Selected checkpoint is incompatible with target architecture: {incompatible}")
+        state = remapped
+        LOGGER.info("Initialized %d blocks from source indices %s", target_depth, block_indices)
     filtered = {}
     skipped = []
     for key, value in state.items():
@@ -443,7 +483,10 @@ def main() -> None:
         step = int(resume.name.rsplit("-", 1)[-1])
         LOGGER.info("Resumed from %s", resume)
     elif config.pretrained:
-        load_pretrained(accelerator.unwrap_model(model), ema, config.pretrained)
+        load_pretrained(
+            accelerator.unwrap_model(model), ema, config.pretrained,
+            block_indices=getattr(config, "pretrained_block_indices", None),
+        )
         LOGGER.info("Loaded pretrained model from %s", config.pretrained)
 
     progress = tqdm(
