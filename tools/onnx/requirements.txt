@@ -1,0 +1,3 @@
+# Additional export dependencies; install into your existing PyTorch environment.
+onnx>=1.16
+onnxruntime-gpu>=1.21
