@@ -38,6 +38,13 @@ WebGPU 验证通过前建议另存，不覆盖旧模型。导出固定 batch siz
 MatMul，绕过已观察到的 WebGPU 卷积数值偏差。替换仅影响导出实例，不改变训练、
 原生推理或 checkpoint。
 
+Pixel DiT 的全部自注意力和交叉注意力默认导出为 ONNX Runtime 的
+`com.microsoft.MultiHeadAttention`，保留 QKV 投影、QK 归一化和 RoPE。
+DINO 的 FP16 和 FP32 ONNX 均未使用 fused attention，保留原有分离的
+MatMul / Softmax 注意力计算，并独立导出。输入输出及导出命令不变；需要支持该算子的
+ONNX Runtime 后端，WebGPU 实验使用 `onnxruntime-web 1.30.0`。
+FP16 融合注意力内部使用混合精度，具体由运行时决定；融合不保证加速。
+
 `--verify` 比较 PyTorch 导出模块与 ONNX Runtime CUDA，不运行 WebGPU。
 浏览器数值对齐步骤见 [调试文档](DEBUG.md)。
 

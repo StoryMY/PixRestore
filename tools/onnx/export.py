@@ -19,6 +19,11 @@ import onnx
 import torch
 from torch import nn
 
+if __package__:
+    from .fuse_attention import fuse_pixel_attention
+else:
+    from fuse_attention import fuse_pixel_attention
+
 # DINO's optional xFormers kernels cannot be traced by the legacy ONNX exporter.
 os.environ['XFORMERS_DISABLED'] = '1'
 
@@ -287,7 +292,7 @@ def main() -> None:
     inference.load_weights(model, weight_path, state=state)
     source_depth, kept_blocks = prune_pixel_dit_depth(model, args.pixel_depth)
     model.to(device=device, dtype=dtype).eval().requires_grad_(False)
-    # ONNX Runtime WebGPU needs explicit MatMul/Softmax rather than PyTorch fused SDPA.
+    # Trace explicit attention first, then fuse its ONNX core into ORT MHA.
     model.disable_fused_attn()
     from pixrestore.onnx_compat import apply_webgpu_compat
     apply_webgpu_compat(model)
@@ -328,6 +333,15 @@ def main() -> None:
         ["x_pred"],
     )
 
+    attention_specs = {
+        f"/model/blocks.{index}/{name}/": (attention.num_heads, attention.scale)
+        for index, block in enumerate(model.blocks)
+        for name in ("attn", "cross_attn")
+        if (attention := getattr(block, name, None)) is not None
+    }
+    fused_count = fuse_pixel_attention(args.output_dir / "pixel_dit.onnx", attention_specs)
+    print(f"Fused {fused_count} Pixel DiT attention cores into com.microsoft.MultiHeadAttention")
+
     manifest = {
         "format": "pixrestore-webgpu-v1",
         "checkpoint": str(checkpoint),
@@ -358,6 +372,7 @@ def main() -> None:
             "depth": {"source": source_depth, "keptBlocks": list(kept_blocks)},
             "sourceResolution": training_resolution,
             "patchEmbedding": "reshape-transpose-matmul",
+            "attention": {"operator": "com.microsoft.MultiHeadAttention", "count": fused_count},
         },
         "singleStepSampling": {
             "output": "x_pred",
