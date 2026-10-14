@@ -584,6 +584,7 @@ def main() -> None:
             if not accelerator.sync_gradients:
                 continue
             step += 1
+            progress.set_postfix(loss=f"{loss.detach().item():.4f}", refresh=False)
             progress.update(1)
             update_ema(ema, accelerator.unwrap_model(model), config.ema_decay)
             logs = {"loss": loss.detach(), "lr": scheduler.get_last_lr()[0]}
@@ -597,7 +598,6 @@ def main() -> None:
                         "dino_gan/discriminator_fake": discriminator_fake_loss.detach(),
                     }
                 )
-            progress.set_postfix(loss=f"{loss.detach().item():.4f}")
             if config.report_to:
                 accelerator.log(logs, step=step)
 
